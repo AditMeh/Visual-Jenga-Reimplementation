@@ -4,6 +4,15 @@ import torch
 import matplotlib.pyplot as plt
 import re
 import cv2
+from diffusers import AutoPipelineForInpainting
+import torch
+from PIL import Image, ImageOps, ImageFilter
+import numpy as np
+from utils import crop_to_mask, cosine_similarity_between_features
+from dino_metric import get_dino_features
+import copy
+import argparse
+
 
 from PIL import Image
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -13,12 +22,14 @@ from transformers import (
     GenerationConfig,
     BitsAndBytesConfig
 )
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+NUM_INPAINTING_TRIALS = 10
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 quant_config = BitsAndBytesConfig(load_in_4bit=True)
 # Load SAM2 model.
-predictor = SAM2ImagePredictor.from_pretrained('facebook/sam2.1-hiera-large')
+predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2.1-hiera-large")
+
 # Load Molmo model.
 processor = AutoProcessor.from_pretrained(
     'allenai/MolmoE-1B-0924', 
@@ -34,89 +45,25 @@ model = AutoModelForCausalLM.from_pretrained(
     torch_dtype='auto'
 )
 
-# Helper functions for SAM2 segmentation map visualization.
-def show_mask(mask, ax, random_color=True, borders = True):
-    if random_color:
-        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
-    else:
-        color = np.array([255/255, 40/255, 50/255, 0.6])
+# Load the inpainting pipeline
+pipe = AutoPipelineForInpainting.from_pretrained(
+    "stable-diffusion-v1-5/stable-diffusion-v1-5", torch_dtype=torch.float16
+).to(device)
+
+
+def show_mask(mask):
+    color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
     h, w = mask.shape[-2:]
     mask = mask.astype(np.uint8)
     mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-    
-    # if borders:
-    #     import cv2
-    #     contours, _ = cv2.findContours(
-    #         mask,cv2.RETR_EXTERNAL, 
-    #         cv2.CHAIN_APPROX_NONE
-    #     )
-    #     # Try to smooth contours
-    #     contours = [
-    #         cv2.approxPolyDP(
-    #             contour, epsilon=0.01, closed=True
-    #         ) for contour in contours
-    #     ]
-    #     mask_image = cv2.drawContours(
-    #         mask_image, 
-    #         contours, 
-    #         -1, 
-    #         (1, 1, 1, 0.5), 
-    #         thickness=2
-    #     ) 
-    ax.imshow(mask_image)
-def show_points(coords, labels, ax, marker_size=375):
-    pos_points = coords[labels==1]
-    neg_points = coords[labels==0]
-    ax.scatter(
-        pos_points[:, 0], 
-        pos_points[:, 1], 
-        color='green', 
-        marker='.', 
-        s=marker_size, 
-        edgecolor='white', 
-        linewidth=1.25
-    )
-    ax.scatter(
-        neg_points[:, 0], 
-        neg_points[:, 1], 
-        color='red', 
-        marker='.', 
-        s=marker_size, 
-        edgecolor='white', 
-        linewidth=1.25
-    )   
-def show_box(box, ax):
-    x0, y0 = box[0], box[1]
-    w, h = box[2] - box[0], box[3] - box[1]
-    ax.add_patch(plt.Rectangle(
-        (x0, y0), 
-        w, 
-        h, 
-        edgecolor='green', 
-        facecolor=(0, 0, 0, 0), 
-        lw=2)
-    )    
-def show_masks(
-    image, 
-    masks, 
-    scores, 
-    point_coords=None, 
-    box_coords=None, 
-    input_labels=None, 
-    borders=True
-):
-    f, ax = plt.subplots(1,1, figsize=(10, 10))
-    ax.imshow(image)
+    return mask_image
+
+
+def show_masks(masks, scores):
     for i, (mask, score) in enumerate(zip(masks, scores)):
         if i == 0:  # Only show the highest scoring mask.
-            show_mask(mask, plt.gca(), random_color=True, borders=borders)
-
-    if point_coords is not None:
-        assert input_labels is not None
-        show_points(point_coords, input_labels, plt.gca())
-    ax.axis('off')
-    return f
-
+            mask_image = show_mask(mask)
+    return mask_image
 
 
 def get_coords(output_string, image):
@@ -166,21 +113,10 @@ def get_output(image, prompt='Describe this image.'):
     generated_tokens = output[0, inputs['input_ids'].size(1):]
     generated_text = processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
-    print(generated_text)
     return generated_text
 
 
-
-def process_image(image, prompt):
-    """
-    Function combining all the components and returning the final 
-    segmentation map.
-    :param image: PIL image.
-    :param prompt: User prompt.
-    Returns:
-        fig: Final segmentation map.
-        prompt: Prompt from the Molmo model.
-    """
+def get_masks(image, prompt):
     # Get coordinates from the model output.
     output = get_output(image, prompt)
     coords = get_coords(output, image)
@@ -188,9 +124,8 @@ def process_image(image, prompt):
     # Prepare input for SAM
     
     # assume each point is an independent object
-    figs = []
+    masks_pngs = []
     for point in coords:
-        print(point)
         input_points = np.array([point])
         input_labels = np.ones(len(input_points), dtype=np.int32)
     
@@ -212,24 +147,68 @@ def process_image(image, prompt):
         masks = masks[sorted_ind]
         scores = scores[sorted_ind]
 
+        # TODO: don't hardcode this
         num_white = np.sum(masks[0])
         if num_white < 1000:
             continue
-        
-        fig = show_masks(
-            image, 
-            masks, 
-            scores, 
-            point_coords=input_points, 
-            input_labels=input_labels, 
-            borders=False
-        )
-        figs.append(fig)
+
+        mask_image = show_masks(masks, scores)
+        masks_pngs.append(mask_image)
+
+    return masks_pngs
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Process a filename and a prompt.")
+    parser.add_argument("filename", type=str, help="Path to the input file")
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        help="Prompt text to process",
+        default="point to objects in the image, both animals and furniture",
+    )
+    args = parser.parse_args()
+
+    masks = get_masks(Image.open(args.filename).convert("RGB"), args.prompt)
+
+    init_image = Image.open("meow.png").convert("RGB").resize((512, 512))
+ 
+    f, ax = plt.subplots(len(masks), NUM_INPAINTING_TRIALS)
     
-    return figs, output
+    for mask_idx, rgba_mask in enumerate(masks):
+        rgba_mask = (rgba_mask > 0).astype(np.float32)
+        rgba_mask = (rgba_mask * 255).astype(np.uint8)
 
+        rgba_mask = Image.fromarray(rgba_mask, mode="RGBA")
+        grayscale_mask = rgba_mask.convert("L")
 
-f, o = process_image(Image.open("meow.png").convert('RGB'), "point to objects in the image, both animals and furniture")
+        # Resize the image
+        grayscale_mask = grayscale_mask.resize((512, 512), resample=Image.NEAREST)
+        grayscale_mask = grayscale_mask.filter(ImageFilter.MaxFilter(size=11))
 
-for i in range(len(f)):
-    f[i].savefig(f"{i}.png")
+        prompt = "Full HD, 4K, high quality, high resolution, photorealistic"
+        negative_prompt = "bad anatomy, bad proportions, blurry, cropped, deformed, disfigured, duplicate, error, extra limbs, gross proportions, jpeg artifacts, long neck, low quality, lowres, malformed, morbid, mutated, mutilated, out of frame, ugly, worst quality"
+
+        
+        for trial_num in range(NUM_INPAINTING_TRIALS):
+            # Perform inpainting
+            result = pipe(
+                prompt=prompt,
+                image=init_image,
+                mask_image=grayscale_mask,
+                num_inference_steps=400,
+                negative_prompt=negative_prompt,
+            ).images[0]
+            
+            ax[mask_idx][trial_num].imshow(result)
+            ax[mask_idx][trial_num].axis('off')
+
+            crop1 = crop_to_mask(result, grayscale_mask)
+            crop2 = crop_to_mask(init_image, grayscale_mask)
+
+            crop1_dino = get_dino_features(crop1)
+            crop2_dino = get_dino_features(crop2)
+
+            cos_sim = cosine_similarity_between_features(crop1_dino, crop2_dino)
+            ax[mask_idx][trial_num].set_title(f"{round(cos_sim,3)}", fontsize=10)
+    f.savefig("masked.png")
