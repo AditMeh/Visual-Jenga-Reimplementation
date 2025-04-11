@@ -1,3 +1,4 @@
+
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -104,8 +105,8 @@ def show_masks(
     input_labels=None, 
     borders=True
 ):
-    plt.figure(figsize=(10, 10))
-    plt.imshow(image)
+    f, ax = plt.subplots(1,1, figsize=(10, 10))
+    ax.imshow(image)
     for i, (mask, score) in enumerate(zip(masks, scores)):
         if i == 0:  # Only show the highest scoring mask.
             show_mask(mask, plt.gca(), random_color=True, borders=borders)
@@ -113,8 +114,8 @@ def show_masks(
     if point_coords is not None:
         assert input_labels is not None
         show_points(point_coords, input_labels, plt.gca())
-    plt.axis('off')
-    return plt
+    ax.axis('off')
+    return f
 
 
 
@@ -186,44 +187,49 @@ def process_image(image, prompt):
     
     # Prepare input for SAM
     
-    # assume each point is an independet
-    input_points = np.array(coords)
-    input_labels = np.ones(len(input_points), dtype=np.int32)
+    # assume each point is an independent object
+    figs = []
+    for point in coords:
+        print(point)
+        input_points = np.array([point])
+        input_labels = np.ones(len(input_points), dtype=np.int32)
     
+        # Convert image to numpy array if it's not already.
+        if isinstance(image, Image.Image):
+            image = np.array(image)
+        
+        # Predict mask.
+        predictor.set_image(image)
+        with torch.no_grad():
+            masks, scores, logits = predictor.predict(
+                point_coords=input_points,
+                point_labels=input_labels,
+                multimask_output=False,
+            )
+        
+        # Sort masks by score.
+        sorted_ind = np.argsort(scores)[::-1]
+        masks = masks[sorted_ind]
+        scores = scores[sorted_ind]
 
-    # Convert image to numpy array if it's not already.
-    if isinstance(image, Image.Image):
-        image = np.array(image)
-    
-    # Predict mask.
-    predictor.set_image(image)
-    with torch.no_grad():
-        masks, scores, logits = predictor.predict(
-            point_coords=input_points,
-            point_labels=input_labels,
-            multimask_output=False,
+        num_white = np.sum(masks[0])
+        if num_white < 1000:
+            continue
+        
+        fig = show_masks(
+            image, 
+            masks, 
+            scores, 
+            point_coords=input_points, 
+            input_labels=input_labels, 
+            borders=False
         )
+        figs.append(fig)
     
-    # Sort masks by score.
-    sorted_ind = np.argsort(scores)[::-1]
-    masks = masks[sorted_ind]
-    scores = scores[sorted_ind]
-    
-    print(len(masks))
-    image = np.zeros_like(image)
-    fig = show_masks(
-        image, 
-        masks, 
-        scores, 
-        point_coords=input_points, 
-        input_labels=input_labels, 
-        borders=False
-    )
-    print(np.unique(masks[0]))
-    
-    return fig, output
+    return figs, output
 
 
-f, o = process_image(Image.open("meow.png").convert('RGB'), "point to the cat")
+f, o = process_image(Image.open("meow.png").convert('RGB'), "point to objects in the image, both animals and furniture")
 
-f.savefig("fig.png")
+for i in range(len(f)):
+    f[i].savefig(f"{i}.png")
