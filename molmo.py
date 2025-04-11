@@ -1,4 +1,3 @@
-
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -11,43 +10,45 @@ from transformers import (
     AutoModelForCausalLM,
     AutoProcessor,
     GenerationConfig,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
 )
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 quant_config = BitsAndBytesConfig(load_in_4bit=True)
 # Load SAM2 model.
-predictor = SAM2ImagePredictor.from_pretrained('facebook/sam2.1-hiera-large')
+predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2.1-hiera-large")
 # Load Molmo model.
 processor = AutoProcessor.from_pretrained(
-    'allenai/MolmoE-1B-0924', 
-    trust_remote_code=True, 
-    device_map='auto', 
-    torch_dtype='auto'
+    "allenai/MolmoE-1B-0924",
+    trust_remote_code=True,
+    device_map="auto",
+    torch_dtype="auto",
 )
 model = AutoModelForCausalLM.from_pretrained(
-    'allenai/MolmoE-1B-0924', 
-    trust_remote_code=True, 
-    offload_folder='offload', 
-    quantization_config=quant_config, 
-    torch_dtype='auto'
+    "allenai/MolmoE-1B-0924",
+    trust_remote_code=True,
+    offload_folder="offload",
+    quantization_config=quant_config,
+    torch_dtype="auto",
 )
 
+
 # Helper functions for SAM2 segmentation map visualization.
-def show_mask(mask, ax, random_color=True, borders = True):
+def show_mask(mask, ax, random_color=True, borders=True):
     if random_color:
         color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
     else:
-        color = np.array([255/255, 40/255, 50/255, 0.6])
+        color = np.array([255 / 255, 40 / 255, 50 / 255, 0.6])
     h, w = mask.shape[-2:]
     mask = mask.astype(np.uint8)
     mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-    
+
     # if borders:
     #     import cv2
     #     contours, _ = cv2.findContours(
-    #         mask,cv2.RETR_EXTERNAL, 
+    #         mask,cv2.RETR_EXTERNAL,
     #         cv2.CHAIN_APPROX_NONE
     #     )
     #     # Try to smooth contours
@@ -57,66 +58,67 @@ def show_mask(mask, ax, random_color=True, borders = True):
     #         ) for contour in contours
     #     ]
     #     mask_image = cv2.drawContours(
-    #         mask_image, 
-    #         contours, 
-    #         -1, 
-    #         (1, 1, 1, 0.5), 
+    #         mask_image,
+    #         contours,
+    #         -1,
+    #         (1, 1, 1, 0.5),
     #         thickness=2
-    #     ) 
+    #     )
     ax.imshow(mask_image)
+    return mask_image
+
+
 def show_points(coords, labels, ax, marker_size=375):
-    pos_points = coords[labels==1]
-    neg_points = coords[labels==0]
+    pos_points = coords[labels == 1]
+    neg_points = coords[labels == 0]
     ax.scatter(
-        pos_points[:, 0], 
-        pos_points[:, 1], 
-        color='green', 
-        marker='.', 
-        s=marker_size, 
-        edgecolor='white', 
-        linewidth=1.25
+        pos_points[:, 0],
+        pos_points[:, 1],
+        color="green",
+        marker=".",
+        s=marker_size,
+        edgecolor="white",
+        linewidth=1.25,
     )
     ax.scatter(
-        neg_points[:, 0], 
-        neg_points[:, 1], 
-        color='red', 
-        marker='.', 
-        s=marker_size, 
-        edgecolor='white', 
-        linewidth=1.25
-    )   
+        neg_points[:, 0],
+        neg_points[:, 1],
+        color="red",
+        marker=".",
+        s=marker_size,
+        edgecolor="white",
+        linewidth=1.25,
+    )
+
+
 def show_box(box, ax):
     x0, y0 = box[0], box[1]
     w, h = box[2] - box[0], box[3] - box[1]
-    ax.add_patch(plt.Rectangle(
-        (x0, y0), 
-        w, 
-        h, 
-        edgecolor='green', 
-        facecolor=(0, 0, 0, 0), 
-        lw=2)
-    )    
+    ax.add_patch(
+        plt.Rectangle((x0, y0), w, h, edgecolor="green", facecolor=(0, 0, 0, 0), lw=2)
+    )
+
+
 def show_masks(
-    image, 
-    masks, 
-    scores, 
-    point_coords=None, 
-    box_coords=None, 
-    input_labels=None, 
-    borders=True
+    image,
+    masks,
+    scores,
+    point_coords=None,
+    box_coords=None,
+    input_labels=None,
+    borders=True,
 ):
-    f, ax = plt.subplots(1,1, figsize=(10, 10))
+    f, ax = plt.subplots(1, 1, figsize=(10, 10))
     ax.imshow(image)
     for i, (mask, score) in enumerate(zip(masks, scores)):
         if i == 0:  # Only show the highest scoring mask.
-            show_mask(mask, plt.gca(), random_color=True, borders=borders)
+            mask_image = show_mask(mask, plt.gca(), random_color=True, borders=borders)
 
     if point_coords is not None:
         assert input_labels is not None
         show_points(point_coords, input_labels, plt.gca())
-    ax.axis('off')
-    return f
-
+    ax.axis("off")
+    return f, mask_image
 
 
 def get_coords(output_string, image):
@@ -131,20 +133,28 @@ def get_coords(output_string, image):
     """
     image = np.array(image)
     h, w = image.shape[:2]
-    
+
     coordinates = None
-    if 'points' in output_string:
+    if "points" in output_string:
         matches = re.findall(r'(x\d+)="([\d.]+)" (y\d+)="([\d.]+)"', output_string)
-        coordinates = [(int(float(x_val)/100*w), int(float(y_val)/100*h)) for _, x_val, _, y_val in matches]
+        coordinates = [
+            (int(float(x_val) / 100 * w), int(float(y_val) / 100 * h))
+            for _, x_val, _, y_val in matches
+        ]
     else:
         match = re.search(r'x="([\d.]+)" y="([\d.]+)"', output_string)
         if match:
-            coordinates = [(int(float(match.group(1))/100*w), int(float(match.group(2))/100*h))]
-    
+            coordinates = [
+                (
+                    int(float(match.group(1)) / 100 * w),
+                    int(float(match.group(2)) / 100 * h),
+                )
+            ]
+
     return coordinates
 
 
-def get_output(image, prompt='Describe this image.'):
+def get_output(image, prompt="Describe this image."):
     """
     Function to get output from Molmo model given an image and a prompt.
 
@@ -156,24 +166,25 @@ def get_output(image, prompt='Describe this image.'):
     """
     inputs = processor.process(images=[image], text=prompt)
     inputs = {k: v.to(model.device).unsqueeze(0) for k, v in inputs.items()}
-    
+
     output = model.generate_from_batch(
         inputs,
-        GenerationConfig(max_new_tokens=200, stop_strings='<|endoftext|>'),
-        tokenizer=processor.tokenizer
+        GenerationConfig(max_new_tokens=200, stop_strings="<|endoftext|>"),
+        tokenizer=processor.tokenizer,
     )
-    
-    generated_tokens = output[0, inputs['input_ids'].size(1):]
-    generated_text = processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
+    generated_tokens = output[0, inputs["input_ids"].size(1) :]
+    generated_text = processor.tokenizer.decode(
+        generated_tokens, skip_special_tokens=True
+    )
 
     print(generated_text)
     return generated_text
 
 
-
 def process_image(image, prompt):
     """
-    Function combining all the components and returning the final 
+    Function combining all the components and returning the final
     segmentation map.
     :param image: PIL image.
     :param prompt: User prompt.
@@ -184,20 +195,21 @@ def process_image(image, prompt):
     # Get coordinates from the model output.
     output = get_output(image, prompt)
     coords = get_coords(output, image)
-    
+
     # Prepare input for SAM
-    
+
     # assume each point is an independent object
     figs = []
+    masks_pngs = []
     for point in coords:
         print(point)
         input_points = np.array([point])
         input_labels = np.ones(len(input_points), dtype=np.int32)
-    
+
         # Convert image to numpy array if it's not already.
         if isinstance(image, Image.Image):
             image = np.array(image)
-        
+
         # Predict mask.
         predictor.set_image(image)
         with torch.no_grad():
@@ -206,7 +218,7 @@ def process_image(image, prompt):
                 point_labels=input_labels,
                 multimask_output=False,
             )
-        
+
         # Sort masks by score.
         sorted_ind = np.argsort(scores)[::-1]
         masks = masks[sorted_ind]
@@ -215,21 +227,27 @@ def process_image(image, prompt):
         num_white = np.sum(masks[0])
         if num_white < 1000:
             continue
-        
-        fig = show_masks(
-            image, 
-            masks, 
-            scores, 
-            point_coords=input_points, 
-            input_labels=input_labels, 
-            borders=False
+
+        print(type(masks))
+        fig, mask_image = show_masks(
+            image,
+            masks,
+            scores,
+            point_coords=input_points,
+            input_labels=input_labels,
+            borders=False,
         )
         figs.append(fig)
-    
-    return figs, output
+        masks_pngs.append(mask_image)
+
+    return figs, output, masks_pngs
 
 
-f, o = process_image(Image.open("meow.png").convert('RGB'), "point to objects in the image, both animals and furniture")
+f, o, masks = process_image(
+    Image.open("meow.png").convert("RGB"),
+    "point to objects in the image, both animals and furniture",
+)
 
 for i in range(len(f)):
     f[i].savefig(f"{i}.png")
+    np.save(f"{i}.npy", masks[i])
