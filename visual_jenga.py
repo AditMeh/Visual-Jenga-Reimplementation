@@ -23,7 +23,7 @@ from transformers import (
     BitsAndBytesConfig
 )
 
-NUM_INPAINTING_TRIALS = 10
+NUM_INPAINTING_TRIALS = 5
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 quant_config = BitsAndBytesConfig(load_in_4bit=True)
@@ -173,7 +173,7 @@ if __name__ == "__main__":
 
     init_image = Image.open("meow.png").convert("RGB").resize((512, 512))
  
-    f, ax = plt.subplots(len(masks), NUM_INPAINTING_TRIALS)
+    f, ax = plt.subplots(len(masks), NUM_INPAINTING_TRIALS, figsize=(6.4 * 4, 4.8 * 4),  constrained_layout=True)
     
     for mask_idx, rgba_mask in enumerate(masks):
         rgba_mask = (rgba_mask > 0).astype(np.float32)
@@ -210,5 +210,5 @@ if __name__ == "__main__":
             crop2_dino = get_dino_features(crop2)
 
             cos_sim = cosine_similarity_between_features(crop1_dino, crop2_dino)
-            ax[mask_idx][trial_num].set_title(f"{round(cos_sim,3)}", fontsize=10)
+            ax[mask_idx][trial_num].set_title(f"{round(cos_sim,3)}", fontsize=24)
     f.savefig("masked.png")
