@@ -1,4 +1,3 @@
-
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -12,6 +11,7 @@ from utils import crop_to_mask, cosine_similarity_between_features
 from dino_metric import get_dino_features
 import copy
 import argparse
+from diffusers import StableDiffusionInpaintPipeline, DiffusionPipeline
 
 
 from PIL import Image
@@ -20,35 +20,37 @@ from transformers import (
     AutoModelForCausalLM,
     AutoProcessor,
     GenerationConfig,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
 )
 
 NUM_INPAINTING_TRIALS = 5
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 quant_config = BitsAndBytesConfig(load_in_4bit=True)
-# Load SAM2 model.
+# Load SAM2 model
 predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2.1-hiera-large")
 
-# Load Molmo model.
+# Load Molmo model
 processor = AutoProcessor.from_pretrained(
-    'allenai/MolmoE-1B-0924', 
-    trust_remote_code=True, 
-    device_map='auto', 
-    torch_dtype='auto'
-)
-model = AutoModelForCausalLM.from_pretrained(
-    'allenai/MolmoE-1B-0924', 
-    trust_remote_code=True, 
-    offload_folder='offload', 
-    quantization_config=quant_config, 
-    torch_dtype='auto'
+    "allenai/MolmoE-1B-0924",
+    trust_remote_code=True,
+    device_map="auto",
+    torch_dtype="auto",
 )
 
-# Load the inpainting pipeline
-pipe = AutoPipelineForInpainting.from_pretrained(
-    "stable-diffusion-v1-5/stable-diffusion-v1-5", torch_dtype=torch.float16
-).to(device)
+model = AutoModelForCausalLM.from_pretrained(
+    "allenai/MolmoE-1B-0924",
+    trust_remote_code=True,
+    offload_folder="offload",
+    quantization_config=quant_config,
+    torch_dtype="auto",
+)
+
+pipe = DiffusionPipeline.from_pretrained(
+    "stabilityai/stable-diffusion-2-inpainting",
+    torch_dtype=torch.float16,
+    variant="fp16",
+).to("cuda")
 
 
 def show_mask(mask):
@@ -78,20 +80,28 @@ def get_coords(output_string, image):
     """
     image = np.array(image)
     h, w = image.shape[:2]
-    
+
     coordinates = None
-    if 'points' in output_string:
+    if "points" in output_string:
         matches = re.findall(r'(x\d+)="([\d.]+)" (y\d+)="([\d.]+)"', output_string)
-        coordinates = [(int(float(x_val)/100*w), int(float(y_val)/100*h)) for _, x_val, _, y_val in matches]
+        coordinates = [
+            (int(float(x_val) / 100 * w), int(float(y_val) / 100 * h))
+            for _, x_val, _, y_val in matches
+        ]
     else:
         match = re.search(r'x="([\d.]+)" y="([\d.]+)"', output_string)
         if match:
-            coordinates = [(int(float(match.group(1))/100*w), int(float(match.group(2))/100*h))]
-    
+            coordinates = [
+                (
+                    int(float(match.group(1)) / 100 * w),
+                    int(float(match.group(2)) / 100 * h),
+                )
+            ]
+
     return coordinates
 
 
-def get_output(image, prompt='Describe this image.'):
+def get_output(image, prompt="Describe this image."):
     """
     Function to get output from Molmo model given an image and a prompt.
 
@@ -103,15 +113,17 @@ def get_output(image, prompt='Describe this image.'):
     """
     inputs = processor.process(images=[image], text=prompt)
     inputs = {k: v.to(model.device).unsqueeze(0) for k, v in inputs.items()}
-    
+
     output = model.generate_from_batch(
         inputs,
-        GenerationConfig(max_new_tokens=200, stop_strings='<|endoftext|>'),
-        tokenizer=processor.tokenizer
+        GenerationConfig(max_new_tokens=200, stop_strings="<|endoftext|>"),
+        tokenizer=processor.tokenizer,
     )
-    
-    generated_tokens = output[0, inputs['input_ids'].size(1):]
-    generated_text = processor.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
+    generated_tokens = output[0, inputs["input_ids"].size(1) :]
+    generated_text = processor.tokenizer.decode(
+        generated_tokens, skip_special_tokens=True
+    )
 
     return generated_text
 
@@ -120,19 +132,19 @@ def get_masks(image, prompt):
     # Get coordinates from the model output.
     output = get_output(image, prompt)
     coords = get_coords(output, image)
-    
+
     # Prepare input for SAM
-    
+
     # assume each point is an independent object
     masks_pngs = []
     for point in coords:
         input_points = np.array([point])
         input_labels = np.ones(len(input_points), dtype=np.int32)
-    
+
         # Convert image to numpy array if it's not already.
         if isinstance(image, Image.Image):
             image = np.array(image)
-        
+
         # Predict mask.
         predictor.set_image(image)
         with torch.no_grad():
@@ -141,7 +153,7 @@ def get_masks(image, prompt):
                 point_labels=input_labels,
                 multimask_output=False,
             )
-        
+
         # Sort masks by score.
         sorted_ind = np.argsort(scores)[::-1]
         masks = masks[sorted_ind]
@@ -172,9 +184,14 @@ if __name__ == "__main__":
     masks = get_masks(Image.open(args.filename).convert("RGB"), args.prompt)
 
     init_image = Image.open("meow.png").convert("RGB").resize((512, 512))
- 
-    f, ax = plt.subplots(len(masks), NUM_INPAINTING_TRIALS, figsize=(6.4 * 4, 4.8 * 4),  constrained_layout=True)
-    
+
+    f, ax = plt.subplots(
+        len(masks),
+        NUM_INPAINTING_TRIALS + 1,
+        figsize=(6.4 * 6, 4.8 * 6),
+        constrained_layout=True,
+    )
+
     for mask_idx, rgba_mask in enumerate(masks):
         rgba_mask = (rgba_mask > 0).astype(np.float32)
         rgba_mask = (rgba_mask * 255).astype(np.uint8)
@@ -184,24 +201,32 @@ if __name__ == "__main__":
 
         # Resize the image
         grayscale_mask = grayscale_mask.resize((512, 512), resample=Image.NEAREST)
-        grayscale_mask = grayscale_mask.filter(ImageFilter.MaxFilter(size=11))
+        grayscale_mask = grayscale_mask.filter(ImageFilter.MaxFilter(size=13))
 
         prompt = "Full HD, 4K, high quality, high resolution, photorealistic"
         negative_prompt = "bad anatomy, bad proportions, blurry, cropped, deformed, disfigured, duplicate, error, extra limbs, gross proportions, jpeg artifacts, long neck, low quality, lowres, malformed, morbid, mutated, mutilated, out of frame, ugly, worst quality"
 
-        
+        ax[mask_idx][0].imshow(
+            Image.composite(
+                Image.new("RGBA", init_image.size, (255, 255, 255, 255)),
+                init_image,
+                grayscale_mask,
+            )
+        )
+        ax[mask_idx][0].axis("off")
+
         for trial_num in range(NUM_INPAINTING_TRIALS):
             # Perform inpainting
             result = pipe(
                 prompt=prompt,
                 image=init_image,
                 mask_image=grayscale_mask,
-                num_inference_steps=400,
+                num_inference_steps=100,
                 negative_prompt=negative_prompt,
             ).images[0]
-            
-            ax[mask_idx][trial_num].imshow(result)
-            ax[mask_idx][trial_num].axis('off')
+
+            ax[mask_idx][trial_num + 1].imshow(result)
+            ax[mask_idx][trial_num + 1].axis("off")
 
             crop1 = crop_to_mask(result, grayscale_mask)
             crop2 = crop_to_mask(init_image, grayscale_mask)
@@ -210,5 +235,5 @@ if __name__ == "__main__":
             crop2_dino = get_dino_features(crop2)
 
             cos_sim = cosine_similarity_between_features(crop1_dino, crop2_dino)
-            ax[mask_idx][trial_num].set_title(f"{round(cos_sim,3)}", fontsize=24)
+            ax[mask_idx][trial_num + 1].set_title(f"{round(cos_sim,3)}", fontsize=24)
     f.savefig("masked.png")
