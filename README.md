@@ -27,6 +27,6 @@ The following command takes in an image filepath and generates something similar
 
 - I'm just using DINO, the actual paper uses CLIP too. There are also other similarity options
 
-- The paper uses Adobe Firefly, which isn't open source. I use Attentive Eraser instead (https://github.com/Anonym0u3/AttentiveEraser). It works sometimes, but not as good as what's shown in the paper
+- The paper uses Adobe Firefly, which isn't open source. I use Attentive Eraser instead (https://github.com/Anonym0u3/AttentiveEraser). It works sometimes, but not as good as what's shown in the paper.
 
-- You need to provide molmo a image-specific prompt, like "point at all books". Ideally there should be one prompt that works for all images. 
+- You need to provide molmo a image-specific prompt, like "point at all books". It'll require a bit of prompt tuning before getting a good decomposition. Ideally there should be one prompt that works for all images. 
