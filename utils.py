@@ -2,6 +2,8 @@ from PIL import Image
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torchvision.transforms.functional import to_tensor, gaussian_blur
+from diffusers.utils import load_image
 
 def crop_to_mask(original: Image.Image, mask: Image.Image) -> Image.Image:
     """
@@ -52,3 +54,21 @@ def cosine_similarity_between_features(feat1: torch.Tensor, feat2: torch.Tensor)
 
     # Return the scalar value
     return similarity.item()
+
+def preprocess_image(pil_image, device):
+    image = to_tensor(load_image(pil_image))
+    image = image.unsqueeze_(0).float() * 2 - 1 # [0,1] --> [-1,1]
+    image = image.expand(-1, 3, -1, -1)
+    image = F.interpolate(image, (1024, 1024))
+    image = image.to(torch.float16).to(device)
+    return image
+
+def preprocess_mask(mask_path, device):
+    mask = to_tensor((load_image(mask_path, convert_method=lambda img: img.convert('L'))))
+    mask = mask.unsqueeze_(0).float()  # 0 or 1
+    mask = F.interpolate(mask, (1024, 1024))
+    mask = gaussian_blur(mask, kernel_size=(77, 77))
+    mask[mask < 0.1] = 0
+    mask[mask >= 0.1] = 1
+    mask = mask.to(torch.float16).to(device)
+    return mask

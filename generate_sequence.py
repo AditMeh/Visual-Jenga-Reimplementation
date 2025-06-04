@@ -8,7 +8,12 @@ from diffusers import AutoPipelineForInpainting
 import torch
 from PIL import Image, ImageOps, ImageFilter
 import numpy as np
-from utils import crop_to_mask, cosine_similarity_between_features, preprocess_image, preprocess_mask
+from utils import (
+    crop_to_mask,
+    cosine_similarity_between_features,
+    preprocess_image,
+    preprocess_mask,
+)
 from dino_metric import get_dino_features
 import copy
 import argparse
@@ -24,55 +29,27 @@ from transformers import (
     BitsAndBytesConfig,
 )
 
-from PIL import Image
-import numpy as np
-
-def compute_iou(mask1, mask2):
-    arr1 = np.array(mask1).astype(bool)
-    arr2 = np.array(mask2).astype(bool)
-
-    intersection = np.logical_and(arr1, arr2).sum()
-    union = np.logical_or(arr1, arr2).sum()
-
-    if union == 0:
-        return 0.0
-    return intersection / union
-
-def prune_high_iou_masks(masks, iou_threshold=0.8):
-    keep = []
-    for i, mask in enumerate(masks):
-        should_keep = True
-        for kept_mask in keep:
-            iou = compute_iou(mask, kept_mask)
-            if iou >= iou_threshold:
-                should_keep = False
-                break
-        if should_keep:
-            keep.append(mask)
-    return keep
-
 NUM_INPAINTING_TRIALS = 5
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Load SAM2 model
 predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2.1-hiera-large")
 
-quant_config = BitsAndBytesConfig(load_in_4bit=True)
 # Load Molmo model
 processor = AutoProcessor.from_pretrained(
-    "allenai/MolmoE-1B-0924",
+    "allenai/Molmo-7B-D-0924",
     trust_remote_code=True,
     device_map="auto",
-    torch_dtype="auto",
+    # torch_dtype=torch.float16,
 )
 
 model = AutoModelForCausalLM.from_pretrained(
-    "allenai/MolmoE-1B-0924",
+    "allenai/Molmo-7B-D-0924",
     trust_remote_code=True,
     offload_folder="offload",
-    quantization_config=quant_config,
-    torch_dtype="auto",
+    # torch_dtype=torch.float16,
 ).to("cuda")
+
 
 # Load inpainting model
 pipe = DiffusionPipeline.from_pretrained(
@@ -82,7 +59,13 @@ pipe = DiffusionPipeline.from_pretrained(
 ).to("cuda")
 
 # Load eraser pipeline
-scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", clip_sample=False, set_alpha_to_one=False)
+scheduler = DDIMScheduler(
+    beta_start=0.00085,
+    beta_end=0.012,
+    beta_schedule="scaled_linear",
+    clip_sample=False,
+    set_alpha_to_one=False,
+)
 eraser_pipeline = DiffusionPipeline.from_pretrained(
     "stabilityai/stable-diffusion-xl-base-1.0",
     custom_pipeline="pipeline_stable_diffusion_xl_attentive_eraser",
@@ -91,6 +74,7 @@ eraser_pipeline = DiffusionPipeline.from_pretrained(
     use_safetensors=True,
     torch_dtype=torch.float16,
 ).to(device)
+
 
 def show_mask(mask):
     color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
@@ -167,19 +151,33 @@ def get_output(image, prompt="Describe this image."):
     return generated_text
 
 
+def upsample_mask_nearest(rgba_mask):
+    rgba_mask = (rgba_mask > 0).astype(np.float32)
+    rgba_mask = (rgba_mask * 255).astype(np.uint8)
+
+    rgba_mask = Image.fromarray(rgba_mask, mode="RGBA")
+    grayscale_mask = rgba_mask.convert("L")
+
+    # Resize the image
+    grayscale_mask = grayscale_mask.resize((512, 512), resample=Image.NEAREST)
+    grayscale_mask = grayscale_mask.filter(ImageFilter.MaxFilter(size=13))
+    return grayscale_mask
+
+
 def get_masks(image, prompt):
     # Get coordinates from the model output.
     output = get_output(image, prompt)
-    coords = get_coords(output, image)
     print(output)
-    # Prepare input for SAM
+    coords = get_coords(output, image)
+    masks_pngs = []
+
+    if coords == None:
+        return None
 
     # assume each point is an independent object
-    masks_pngs = []
-    for i, point in enumerate(coords):
-        input_points = coords
-        input_labels = np.zeros(len(coords), dtype=np.int32)
-        input_labels[i] = 1
+    for point in coords:
+        input_points = np.array([point])
+        input_labels = np.ones(len(input_points), dtype=np.int32)
 
         # Convert image to numpy array if it's not already.
         if isinstance(image, Image.Image):
@@ -201,14 +199,14 @@ def get_masks(image, prompt):
 
         # TODO: don't hardcode this
         num_white = np.sum(masks[0])
-        mask_image = show_masks(masks, scores)
-        
-        if num_white < 1000 or any([compute_iou(mask_image, m) > 0.8 for m in masks_pngs]):
+        if num_white < 1000:
+            print("skipped mask")
             continue
-        
+
+        mask_image = show_masks(masks, scores)
         masks_pngs.append(mask_image)
 
-    return masks_pngs, coords
+    return masks_pngs
 
 
 if __name__ == "__main__":
@@ -217,90 +215,72 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prompt",
         type=str,
-        help="Prompt text to process",
+        help="List of prompt texts to process",
         default="point to all books in the image",
     )
     args = parser.parse_args()
 
-    masks, coords = get_masks(Image.open(args.filename).convert("RGB"), args.prompt)
-
+    masks = get_masks(Image.open(args.filename).convert("RGB"), args.prompt)
     init_image = Image.open(args.filename).convert("RGB").resize((512, 512))
 
-    f, ax = plt.subplots(
-        len(masks),
-        NUM_INPAINTING_TRIALS + 2,
-        figsize=(6.4 * 6, 4.8 * 6),
-        constrained_layout=True,
-    )
+    counter = 0
+    while masks is not None:
+        best_mask_idx, max_performance = -1, np.inf
+        for mask_idx, rgba_mask in enumerate(masks):
 
-    for mask_idx, rgba_mask in enumerate(masks):
-        rgba_mask = (rgba_mask > 0).astype(np.float32)
-        rgba_mask = (rgba_mask * 255).astype(np.uint8)
+            grayscale_mask = upsample_mask_nearest(rgba_mask)
 
-        rgba_mask = Image.fromarray(rgba_mask, mode="RGBA")
-        grayscale_mask = rgba_mask.convert("L")
+            prompt = "Full HD, 4K, high quality, high resolution, photorealistic"
+            negative_prompt = "bad anatomy, bad proportions, blurry, cropped, deformed, disfigured, duplicate, error, extra limbs, gross proportions, jpeg artifacts, long neck, low quality, lowres, malformed, morbid, mutated, mutilated, out of frame, ugly, worst quality"
 
-        # Resize the image
-        grayscale_mask = grayscale_mask.resize((512, 512), resample=Image.NEAREST)
-        grayscale_mask = grayscale_mask.filter(ImageFilter.MaxFilter(size=13))
+            cos_sim_accum = 0
+            for trial_num in range(NUM_INPAINTING_TRIALS):
+                # Perform inpainting
+                result = pipe(
+                    prompt=prompt,
+                    image=init_image,
+                    mask_image=grayscale_mask,
+                    num_inference_steps=100,
+                    negative_prompt=negative_prompt,
+                ).images[0]
 
-        prompt = "Full HD, 4K, high quality, high resolution, photorealistic"
-        negative_prompt = "bad anatomy, bad proportions, blurry, cropped, deformed, disfigured, duplicate, error, extra limbs, gross proportions, jpeg artifacts, long neck, low quality, lowres, malformed, morbid, mutated, mutilated, out of frame, ugly, worst quality"
+                crop1 = crop_to_mask(result, grayscale_mask)
+                crop2 = crop_to_mask(init_image, grayscale_mask)
 
-        ax[mask_idx][0].imshow(
-            Image.composite(
-                Image.new("RGBA", init_image.size, (255, 255, 255, 255)),
-                init_image,
-                grayscale_mask,
-            )
-        )
-        ax[mask_idx][0].axis("off")
-        ax[mask_idx][1].axis("off")
-        ax[mask_idx][0].set_title("Masked Image", fontsize=24)
-        
-        ax[mask_idx][0].scatter(coords[mask_idx][0], coords[mask_idx][1], color='red', s=40)
-        ax[mask_idx][1].set_title("Object Removal", fontsize=24)
+                crop1_dino = get_dino_features(crop1)
+                crop2_dino = get_dino_features(crop2)
+
+                cos_sim = cosine_similarity_between_features(crop1_dino, crop2_dino)
+                cos_sim_accum += cos_sim
+
+            if cos_sim_accum / NUM_INPAINTING_TRIALS < max_performance:
+                max_performance = cos_sim_accum / NUM_INPAINTING_TRIALS
+                best_mask_idx = mask_idx
 
         erased_image = eraser_pipeline(
-            prompt="", 
+            prompt="",
             image=preprocess_image(init_image, device),
-            mask_image=preprocess_mask(grayscale_mask, device),
+            mask_image=preprocess_mask(
+                upsample_mask_nearest(masks[best_mask_idx]), device
+            ),
             height=1024,
             width=1024,
-            AAS=True, # enable AAS
-            strength=0.8, # inpainting strength
-            rm_guidance_scale=9, # removal guidance scale
-            ss_steps = 9, # similarity suppression steps
-            ss_scale = 0.3, # similarity suppression scale
-            AAS_start_step=0, # AAS start step
-            AAS_start_layer=34, # AAS start layer
-            AAS_end_layer=70, # AAS end layer
-            num_inference_steps=150, # number of inference steps
+            AAS=True,  # enable AAS
+            strength=0.8,  # inpainting strength
+            rm_guidance_scale=9,  # removal guidance scale
+            ss_steps=9,  # similarity suppression steps
+            ss_scale=0.3,  # similarity suppression scale
+            AAS_start_step=0,  # AAS start step
+            AAS_start_layer=34,  # AAS start layer
+            AAS_end_layer=70,  # AAS end layer
+            num_inference_steps=150,  # number of inference steps
             generator=torch.Generator(device=device).manual_seed(123),
             guidance_scale=1,
         ).images[0]
 
-        ax[mask_idx][1].imshow(erased_image.resize((512, 512)))
+        counter += 1
 
-        for trial_num in range(NUM_INPAINTING_TRIALS):
-            # Perform inpainting
-            result = pipe(
-                prompt=prompt,
-                image=init_image,
-                mask_image=grayscale_mask,
-                num_inference_steps=100,
-                negative_prompt=negative_prompt,
-            ).images[0]
+        init_image = erased_image.resize((512, 512)).convert("RGB")
+        init_image.save(f"{counter}.png")
 
-            ax[mask_idx][trial_num + 2].imshow(result)
-            ax[mask_idx][trial_num + 2].axis("off")
-
-            crop1 = crop_to_mask(result, grayscale_mask)
-            crop2 = crop_to_mask(init_image, grayscale_mask)
-
-            crop1_dino = get_dino_features(crop1)
-            crop2_dino = get_dino_features(crop2)
-
-            cos_sim = cosine_similarity_between_features(crop1_dino, crop2_dino)
-            ax[mask_idx][trial_num + 2].set_title(f"{round(cos_sim,3)}", fontsize=24)
-    f.savefig(f"{Path(args.filename).stem}_masked{Path(args.filename).suffix}")
+        masks = get_masks(init_image, args.prompt)
